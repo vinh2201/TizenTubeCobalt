@@ -1,0 +1,34 @@
+{
+  "failing_tests": [
+    "AllocatorShimTest.*",
+    "AlternateBucketDistribution/PartitionAllocThreadCacheTest.*",
+    "FileUtilTest.ChangeDirectoryPermissionsAndEnumerate",
+    "FileUtilTest.ChangeFilePermissionsAndRead",
+    "FileUtilTest.ChangeFilePermissionsAndWrite",
+    "FileUtilTest.PreReadFile_Executable",
+    "FileUtilTest.SetCloseOnExec",
+    "FileUtilTest.SetNonBlocking",
+    "ImmediateCrashTest.ExpectedOpcodeSequence",
+    "LoggingTest.AlwaysLogErrorsToStderr",
+    "LoggingTest.CheckCausesDistinctBreakpoints",
+    "PathServiceTest.Get",
+    "PlatformThreadTest.CanChangeThreadType",
+    "ProcessTest.SetProcessBackgrounded",
+    "ProcessUtilTest.CloneFlags",
+    "ProcessUtilTest.FDRemappingIncludesStdio",
+    "ProcessUtilTest.GetAppOutput",
+    "ProcessUtilTest.GetAppOutputWithExitCode",
+    "ProcessUtilTest.LaunchProcess",
+    "ReadOnlyFileUtilTest.ContentsEqual",
+    "ReadOnlyFileUtilTest.TextContentsEqual",
+    "SamplingHeapProfilerTest.HookedAllocatorMuted",
+    "SamplingHeapProfilerTest.SampleObserver",
+    "Test.firstTest",
+    "ThreadPoolWorkerThreadCachePurgeTest.Purge",
+    "TypedTraceEventFilterDebugAnnotationsTest.*",
+    "TypedTraceEventTest.*"
+  ],
+  "_filtered_b/411746135": [
+    "All/SequenceManagerTest.DelayedTasksDontBadlyStarveNonDelayedWork*"
+  ]
+}
