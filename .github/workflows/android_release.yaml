@@ -22,8 +22,6 @@ jobs:
           path: |
             /root/.gradle/caches
             /root/.gradle/wrapper
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
       - name: Set up Cloud SDK
         uses: isarkis/setup-gcloud@40dce7857b354839efac498d3632050f568090b6
       - name: Set Android env vars
@@ -93,8 +91,6 @@ jobs:
           path: |
             /root/.gradle/caches
             /root/.gradle/wrapper
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
       - name: Set up Cloud SDK
         uses: isarkis/setup-gcloud@40dce7857b354839efac498d3632050f568090b6
       - name: Set Android env vars
