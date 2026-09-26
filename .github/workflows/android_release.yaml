@@ -1,13 +1,17 @@
 name: android_release
 
-# on:
-#   push:
-#     tags:
-#       - 'v*'
+on:
+  workflow_dispatch:
+  push:
+    branches: 
+      - main
+      - dev
 
 jobs:
   android-arm64:
     runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,6 +22,8 @@ jobs:
           path: |
             /root/.gradle/caches
             /root/.gradle/wrapper
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
       - name: Set up Cloud SDK
         uses: isarkis/setup-gcloud@40dce7857b354839efac498d3632050f568090b6
       - name: Set Android env vars
@@ -75,6 +81,8 @@ jobs:
 
   android-arm:
     runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -85,6 +93,8 @@ jobs:
           path: |
             /root/.gradle/caches
             /root/.gradle/wrapper
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
       - name: Set up Cloud SDK
         uses: isarkis/setup-gcloud@40dce7857b354839efac498d3632050f568090b6
       - name: Set Android env vars
