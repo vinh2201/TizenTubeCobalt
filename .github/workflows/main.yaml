@@ -438,6 +438,16 @@ jobs:
       # other steps like depot_tools and checkout. Because I need
       # to verify the performance of overlay in the real world.
       # Before that, keep a weak coupling for easier revert.
+
+      # Bước tạm thời để dọn dẹp cache bị hỏng trên Runner
+      - name: Clean Stale Runner Cache
+        shell: bash
+        run: |
+          if [ ! -f "/runner-cache/golden-workspace/src/build/util/lastchange.py" ]; then
+            echo "Detected corrupted golden workspace! Cleaning up..."
+            rm -rf /runner-cache/golden-workspace/*
+          fi
+
       - name: Prepare OverlayFS Workspace
         id: overlay_workspace
         if: ${{ !contains(matrix.platform, 'tvos') }}
