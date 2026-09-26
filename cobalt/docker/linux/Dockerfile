@@ -2,6 +2,8 @@
 
 # FROM marketplace.gcr.io/google/debian12@${BASE_IMAGE_SHA}
 
+FROM debian:12
+
 # Install any necessary dependencies
 # NOTE: From libxcomposite down, these are minimal requirements to run a
 # V8 snapshot binary, on X11/GTK builds
