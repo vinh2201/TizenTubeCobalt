@@ -1,0 +1,1096 @@
+const assert = require('assert');
+const mod = require('../x.js');
+
+function reset() {
+  mod.state.liked.clear();
+  mod.state.subs.clear();
+  mod.state.v2c.clear();
+  mod.state.loggedIn = null;
+  mod.state.ready = true;
+  mod.state.stripped = 0;
+}
+
+reset();
+mod.state.liked.add('liked1');
+mod.state.subs.add('UCsub');
+// YouTube TV can report LOGGED_IN=false while sending a valid OAuth
+// Authorization header. Captured credential evidence must win over that
+// misleading config flag, and a later cfg() poll must not clear the allowlist.
+{
+  const savedYtcfg = globalThis.ytcfg;
+  try {
+    globalThis.ytcfg = { get(key) { return key === 'LOGGED_IN' ? false : undefined; } };
+    mod.state.lastLoggedIn = true;
+    mod.state.ctx = null;
+    mod.state.key = null;
+    mod.state.hdr = { authorization: 'Bearer real-account-token' };
+    mod.configure();
+    assert.strictEqual(mod.state.loggedIn, true, 'an Authorization header proves the TV session is signed in');
+    assert.strictEqual(mod.statusText(), 'Restricted YouTube - Ready: 1 liked, 1 subscribed', 'a misleading LOGGED_IN=false poll cannot invalidate an authenticated allowlist');
+
+    mod.state.ready = true;
+    mod.state.booting = false;
+    mod.state.errors.length = 0;
+    mod.configure();
+    assert.strictEqual(mod.state.loggedIn, true, 'a repeated misleading LOGGED_IN=false poll cannot demote authenticated state');
+    assert.strictEqual(mod.state.liked.size, 1, 'repeated authentication polling must preserve loaded liked videos');
+    assert.strictEqual(mod.state.subs.size, 1, 'repeated authentication polling must preserve loaded subscriptions');
+  } finally {
+    globalThis.ytcfg = savedYtcfg;
+  }
+}
+
+const feed = {contents:[
+  {videoRenderer:{videoId:'liked1',ownerText:{runs:[{navigationEndpoint:{browseEndpoint:{browseId:'UCother'}}}]}}},
+  {videoRenderer:{videoId:'sub1',ownerText:{runs:[{navigationEndpoint:{browseEndpoint:{browseId:'UCsub'}}}]}}},
+  {videoRenderer:{videoId:'bad1',ownerText:{runs:[{navigationEndpoint:{browseEndpoint:{browseId:'UCbad'}}}]}}}
+]};
+const filtered = mod.filterTree(JSON.parse(JSON.stringify(feed)));
+assert.strictEqual(filtered.contents.length,2);
+assert.deepStrictEqual(filtered.contents.map(x=>x.videoRenderer.videoId).sort(),['liked1','sub1']);
+
+const playerBad=mod.blockPlayerResponse({videoDetails:{videoId:'bad2',channelId:'UCbad'},streamingData:{formats:[1]},captions:{}});
+assert.strictEqual(playerBad.playabilityStatus.status,'ERROR');
+assert.strictEqual(playerBad.streamingData,undefined);
+const playerSub=mod.blockPlayerResponse({videoDetails:{videoId:'ok2',channelId:'UCsub'},streamingData:{formats:[1]}});
+assert.ok(playerSub.streamingData);
+
+reset();
+mod.collectLikedVideoIds({items:[
+  {playlistVideoRenderer:{videoId:'a'}},
+  {videoRenderer:{videoId:'not-liked-recommendation'}},
+  {compactVideoRenderer:{videoId:'not-liked-sidebar'}}
+]});
+assert.deepStrictEqual([...mod.state.liked],['a'],
+  'liked harvesting must require explicit liked-playlist provenance and ignore generic recommendations');
+
+// Modern YouTube TV feeds use tileRenderer instead of the legacy video/grid
+// renderers. The real signed-in TV response proved this shape reaches the app,
+// while the original extractor returned null and left unauthorized tiles live.
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = true;
+mod.state.liked.add('tileLiked');
+mod.state.subs.add('UCtileSub');
+const tileFeed = mod.filterTree(JSON.parse(JSON.stringify({ contents: [
+  { tileRenderer: { style: 'TILE_STYLE_YTLR_ROUND', contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'tileLiked', onSelectCommand: { clickTrackingParams: 'video', watchEndpoint: { videoId: 'tileLiked' }, browseEndpoint: { browseId: 'UCownerLiked' } } } },
+  { tileRenderer: { style: 'TILE_STYLE_YTLR_ROUND', contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'badTileVideo', onSelectCommand: { watchEndpoint: { videoId: 'badTileVideo' }, browseEndpoint: { browseId: 'UCother' } } } },
+  { tileRenderer: { style: 'TILE_STYLE_YTLR_ROUND', contentType: 'TILE_CONTENT_TYPE_CHANNEL', contentId: 'UCtileSub', onSelectCommand: { browseEndpoint: { browseId: 'UCtileSub' } } } },
+  { tileRenderer: { style: 'TILE_STYLE_YTLR_ROUND', contentType: 'TILE_CONTENT_TYPE_CHANNEL', contentId: 'UCnotSubscribed', onSelectCommand: { browseEndpoint: { browseId: 'UCnotSubscribed' } } } }
+] })));
+assert.strictEqual(tileFeed.contents.length, 2, 'modern feed must keep exactly the liked-video and subscribed-channel tiles');
+assert.strictEqual(mod.firstVideoId(tileFeed.contents[0]), 'tileLiked', 'allowed modern video tile must expose its video ID');
+assert.strictEqual(mod.state.stripped, 2, 'unauthorized modern video/channel tiles must be counted as stripped');
+
+reset();
+mod.collectLikedVideoIds({ playlistVideoListRenderer: { contents: [
+  { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'likedTileA', onSelectCommand: { watchEndpoint: { videoId: 'likedTileA' } } } },
+  { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_CHANNEL', contentId: 'UCignored', onSelectCommand: { browseEndpoint: { browseId: 'UCignored' } } } }
+] } });
+assert.deepStrictEqual([...mod.state.liked], ['likedTileA'], 'likes collection must harvest modern video tiles from the liked playlist without treating channel tiles as videos');
+reset();
+mod.collectAllChannelIds({contents:[
+  {channelRenderer:{navigationEndpoint:{browseEndpoint:{browseId:'UCone'}}}},
+  {gridChannelRenderer:{channelId:'UCtwo'}}
+]});
+assert.deepStrictEqual([...mod.state.subs].sort(),['UCone','UCtwo']);
+
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = true;
+mod.state.subs.add('UCstrictSub');
+const poisonedPlayer = mod.blockPlayerResponse({
+  videoDetails: { videoId: 'poisoned-player' },
+  secondaryResults: {
+    channelRenderer: { channelId: 'UCstrictSub' }
+  },
+  streamingData: { formats: [1] }
+});
+assert.strictEqual(poisonedPlayer.playabilityStatus.status, 'ERROR',
+  'an unrelated subscribed channel nested elsewhere in a player payload must not authorize the current video');
+assert.strictEqual(poisonedPlayer.streamingData, undefined,
+  'a player without direct owner-channel provenance must lose streaming data');
+
+const poisonedFeed = mod.filterTree({ contents: [
+  { videoRenderer: {
+      videoId: 'poisoned-feed',
+      ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCactualOwner' } } }] },
+      metadata: { channelRenderer: { channelId: 'UCstrictSub' } }
+  } }
+]});
+assert.strictEqual(poisonedFeed.contents.length, 0,
+  'an unrelated subscribed channel nested in a video renderer must not authorize that video');
+assert.strictEqual(mod.videoOwnerChannelId({
+  videoId: 'owned-video',
+  ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCactualOwner' } } }] },
+  metadata: { channelRenderer: { channelId: 'UCstrictSub' } }
+}), 'UCactualOwner', 'strict owner provenance must prefer the byline tied to the video');
+
+reset();
+mod.collectAllChannelIds({ contents: [
+  { channelRenderer: { navigationEndpoint: { browseEndpoint: { browseId: 'UCrealSub' } } } },
+  { videoRenderer: { videoId: 'recommended-video', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCnotASub' } } }] } } },
+  { metadata: { channelId: 'UCpoisonMetadata' } }
+]});
+assert.deepStrictEqual([...mod.state.subs], ['UCrealSub'],
+  'subscription harvesting must ignore channel ids from video recommendations and generic metadata');
+
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = true;
+mod.state.subs.add('UCmenuOwner');
+const menuOwned = mod.filterTree({ contents: [
+  { tileRenderer: {
+      contentType: 'TILE_CONTENT_TYPE_VIDEO',
+      contentId: 'menu-owned-video',
+      onSelectCommand: { watchEndpoint: { videoId: 'menu-owned-video' } },
+      onLongPressCommand: { showMenuCommand: { menu: { menuRenderer: { items: [
+        { menuNavigationItemRenderer: {
+            text: { runs: [{ text: 'Go to channel' }] },
+            navigationEndpoint: { browseEndpoint: { browseId: 'UCmenuOwner' } }
+        } }
+      ] } } } }
+  } }
+]});
+assert.strictEqual(menuOwned.contents.length, 1,
+  'a video tile may use its own long-press channel navigation as owner provenance');
+assert.strictEqual(mod.videoOwnerChannelId(menuOwned.contents[0]), 'UCmenuOwner',
+  'the exact video tile long-press menu must expose its owner channel');
+
+const menuPoison = mod.filterTree({ contents: [
+  { tileRenderer: {
+      contentType: 'TILE_CONTENT_TYPE_VIDEO',
+      contentId: 'menu-poison-video',
+      onSelectCommand: { watchEndpoint: { videoId: 'menu-poison-video' } },
+      metadata: { menuRenderer: { items: [
+        { menuNavigationItemRenderer: { navigationEndpoint: { browseEndpoint: { browseId: 'UCmenuOwner' } } } }
+      ] } }
+  } }
+]});
+assert.strictEqual(menuPoison.contents.length, 0,
+  'a subscribed channel id outside the video tile long-press menu must not authorize the video');
+
+reset();
+mod.collectGuideSubscriptionIds({guideSubscriptionsSectionRenderer:{items:[
+  {guideEntryRenderer:{navigationEndpoint:{browseEndpoint:{browseId:'UCsubA'}}}}
+]},otherSection:{browseEndpoint:{browseId:'UCnotSub'}}});
+assert.deepStrictEqual([...mod.state.subs],['UCsubA']);
+
+assert.deepStrictEqual(mod.continuationTokens({contents:[
+  {continuationItemRenderer:{continuationEndpoint:{continuationCommand:{token:'t1'}}}},
+  {continuationItemRenderer:{continuationEndpoint:{continuationCommand:{token:'t2'}}}}
+]}),['t1','t2']);
+
+
+// Phone-remote-control surfaces: queue (cast/up-next) and mobile playback responses
+// must go through the same allowlist filter as browse/player responses.
+reset();
+mod.state.liked.add('liked1');
+mod.state.subs.add('UCsub');
+const queueResp = {contents:[
+  {playlistPanelVideoRenderer:{videoId:'liked1',navigationEndpoint:{watchEndpoint:{videoId:'liked1'}}}},
+  {playlistPanelVideoRenderer:{videoId:'badQ',navigationEndpoint:{watchEndpoint:{videoId:'badQ'}}}}
+]};
+const filteredQueue = mod.filterTree(JSON.parse(JSON.stringify(queueResp)));
+assert.strictEqual(filteredQueue.contents.length,1);
+assert.strictEqual(filteredQueue.contents[0].playlistPanelVideoRenderer.videoId,'liked1');
+
+const mobilePlaybackBad = mod.blockPlayerResponse({videoDetails:{videoId:'badM',channelId:'UCbad'},streamingData:{formats:[1]}});
+assert.strictEqual(mobilePlaybackBad.playabilityStatus.status,'ERROR');
+assert.strictEqual(mobilePlaybackBad.streamingData,undefined);
+const mobilePlaybackLiked = mod.blockPlayerResponse({videoDetails:{videoId:'liked1',channelId:'UCother'},streamingData:{formats:[1]}});
+assert.ok(mobilePlaybackLiked.streamingData);
+
+
+// Phone remote control must keep working: pairing/registration endpoints pass
+// through unfiltered, while cast queue and mobile playback responses are filtered.
+const pkg = require('../x.js');
+const pairing = new URL('https://www.youtube.com/youtubei/v1/pairing/create_pairing_code');
+const queueCast = new URL('https://www.youtube.com/youtubei/v1/queue/add');
+const mobilePlayback = new URL('https://www.youtube.com/youtubei/v1/get_mobile_playback');
+assert.strictEqual(pkg.filterTree !== undefined, true);
+
+
+// Phone remote control must keep working: pairing/registration endpoints pass
+// through unfiltered, while cast queue and mobile playback responses are filtered.
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/pairing/create_pairing_code')), false, 'pairing code creation must pass through');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/pairing/get_pairing_code')), false, 'pairing code polling must pass through');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/queue/add')), true, 'cast queue must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/get_mobile_playback')), true, 'mobile playback must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/notification/get_notification_menu')), true, 'notification video surfaces must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/browse')), true, 'browse must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/search')), true, 'search must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/next')), true, 'next/related/autoplay must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/reel/reel_item_watch')), true, 'Shorts/reel surfaces must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/youtubei/v1/player')), true, 'player must be filtered');
+assert.strictEqual(mod.filtapi(new URL('https://www.youtube.com/not_an_api')), false, 'non-API pages must pass through');
+
+(async function () {
+  // Guest/signed-out enforcement is fail-closed; terminal guest status itself
+  // requires genuine account-API proof and is covered by the live HTTP suite.
+  reset();
+  mod.state.loggedIn = false;
+  mod.state.ready = true;
+  const guestFeed = mod.filterTree({ contents: [
+    { videoRenderer: { videoId: 'any1', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCany' } } }] } } }
+  ] });
+  assert.strictEqual(guestFeed.contents.length, 0, 'guest feed must show no videos');
+  const guestPlayer = mod.blockPlayerResponse({ videoDetails: { videoId: 'any2', channelId: 'UCany' }, streamingData: { formats: [1] } });
+  assert.strictEqual(guestPlayer.playabilityStatus.status, 'ERROR', 'guest player must be blocked');
+  assert.strictEqual(guestPlayer.streamingData, undefined, 'guest player must have no streams');
+
+  // Until account data is loaded, discovery cannot trust cached or hydrated
+  // tiles. A not-ready filter is therefore indistinguishable from an empty
+  // allowlist at every visible surface.
+  reset();
+  mod.state.loggedIn = true;
+  mod.state.ready = false;
+  mod.state.liked.add('cachedLiked');
+  mod.state.subs.add('UCcachedSub');
+  const loadingFeed = mod.filterTree({ contents: [
+    { videoRenderer: { videoId: 'cachedLiked', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCcachedSub' } } }] } } },
+    { gridVideoRenderer: { videoId: 'uncached' } }
+  ] });
+  assert.strictEqual(loadingFeed.contents.length, 0, 'not-ready discovery must strip every video');
+  const loadingPlayer = mod.blockPlayerResponse({ videoDetails: { videoId: 'cachedLiked', channelId: 'UCcachedSub' }, streamingData: { formats: [1] } });
+  assert.strictEqual(loadingPlayer.playabilityStatus.status, 'ERROR', 'not-ready playback must be blocked');
+
+  // A second load of the script (e.g. when both the native redirect and the DOM
+  // loader inject it) must reuse the same module instead of double-installing.
+  const firstState = mod.state;
+  const resolved = require.resolve('../x.js');
+  delete require.cache[resolved];
+  const mod2 = require('../x.js');
+  assert.strictEqual(mod2.state, firstState, 'second load must reuse the same module instance');
+
+  // Every stripped video must be counted so device logs can prove blocking.
+  reset();
+  mod.state.stripped = 0;
+  mod.state.liked.add('liked1');
+  const stripFeed = mod.filterTree({ contents: [
+    { videoRenderer: { videoId: 'liked1', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCa' } } }] } } },
+    { videoRenderer: { videoId: 'badX', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCb' } } }] } } }
+  ] });
+  assert.strictEqual(stripFeed.contents.length, 1, 'allowed video stays');
+  assert.strictEqual(mod.state.stripped, 1, 'one disallowed video must be counted as stripped');
+  const stripPlayer = mod.blockPlayerResponse({ videoDetails: { videoId: 'badY', channelId: 'UCb' }, streamingData: { formats: [1] } });
+  assert.strictEqual(stripPlayer.playabilityStatus.status, 'ERROR');
+  assert.strictEqual(mod.state.stripped, 2, 'blocked player must be counted as stripped');
+
+  // Real YouTube TV search responses nest video results deep inside
+  // sectionListRenderer/itemSectionRenderer (the shape captured from the Onn
+  // box). Signed-in search must keep ONLY liked videos and subscribed-channel
+  // videos; signed-out/guest search must show nothing at all.
+  reset();
+  mod.state.loggedIn = true;
+  mod.state.liked.add('likedSearch1');
+  mod.state.subs.add('UCsearchSub');
+  const searchResp = { contents: { twoColumnSearchResultsRenderer: { primaryContents: { sectionListRenderer: { contents: [
+    { itemSectionRenderer: { contents: [
+      { videoRenderer: { videoId: 'likedSearch1', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCother' } } }] } } },
+      { videoRenderer: { videoId: 'badSearch1', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCbad' } } }] } } },
+      { videoRenderer: { videoId: 'subSearch2', ownerText: { runs: [{ navigationEndpoint: { browseEndpoint: { browseId: 'UCsearchSub' } } }] } } },
+      { channelRenderer: { channelId: 'UCsearchSub' } }
+    ] } }
+  ] } } } } };
+  const fSearch = mod.filterTree(JSON.parse(JSON.stringify(searchResp)));
+  const ids = [];
+  (function walk(x) { if (x && typeof x === 'object') { if (typeof x.videoId === 'string') ids.push(x.videoId); for (const k in x) walk(x[k]); } })(fSearch);
+  assert.strictEqual(ids.sort().join(','), 'likedSearch1,subSearch2', 'signed-in search must keep only liked + subscribed results');
+
+  reset();
+  mod.state.loggedIn = false;
+  const gSearch = mod.filterTree(JSON.parse(JSON.stringify(searchResp)));
+  const gids = [];
+  (function walk(x) { if (x && typeof x === 'object') { if (typeof x.videoId === 'string') gids.push(x.videoId); for (const k in x) walk(x[k]); } })(gSearch);
+  assert.strictEqual(gids.length, 0, 'signed-out/guest search must show no videos');
+
+  // Guard/self-heal plumbing: the filter must expose a guard that re-wraps
+  // fetch/XHR if the page ever clobbers the interceptor, and it must never
+  // throw when run repeatedly (YouTube TV can replace window.fetch and the
+  // XHR prototype mid-session).
+  assert.strictEqual(typeof mod.guard, 'function', 'guard must be exported');
+
+
+// --- DOM sweep: unauthorized tiles in initial server-rendered HTML ---
+// The network gate delays JS-initiated requests but cannot block the
+// navigation response itself. After boot arms, sweepDom() must remove
+// unauthorized ytlr-tile-renderer elements from the live document.
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = false;
+mod.state.allowedNames.clear();
+assert.strictEqual(typeof mod.collectChannelNames, 'function', 'collectChannelNames must be exported');
+mod.collectChannelNames({ contents: [
+  { title: { runs: [{ text: 'Sesame Street' }] }, channelId: 'UCsesame' },
+  { title: { runs: [{ text: 'Adam Savage' }] }, browseEndpoint: { browseId: 'UCadam' } },
+  { title: { simpleText: 'Ed Sullivan' }, externalChannelId: 'UCed' },
+  { navigationEndpoint: { browseEndpoint: { browseId: 'UCsub' } }, title: { runs: [{ text: 'My Sub Channel' }] } },
+  { videoRenderer: { videoId: 'someVideo', ownerText: { runs: [{ text: 'Owner Name' }] }, channelId: 'UCowner' } }
+] });
+assert.ok(mod.state.allowedNames.has('sesame street'), 'must collect Sesame Street from title runs');
+assert.ok(mod.state.allowedNames.has('adam savage'), 'must collect Adam Savage from browse endpoint');
+assert.ok(mod.state.allowedNames.has('ed sullivan'), 'must collect Ed Sullivan from simpleText');
+assert.ok(mod.state.allowedNames.has('my sub channel'), 'must collect subscribed channel name');
+assert.ok(mod.state.allowedNames.has('owner name'), 'must collect owner name from video renderer');
+
+assert.strictEqual(typeof mod.tileShouldStay, 'function', 'tileShouldStay must be exported');
+assert.strictEqual(mod.tileShouldStay('Elmo World\nSesame Street\n7M views', mod.state.allowedNames), true,
+  'a tile with an exact visible channel-name line must stay');
+assert.strictEqual(mod.tileShouldStay('Sesame Street documentary\nRandom Channel\n7M views', mod.state.allowedNames), false,
+  'a subscribed channel name appearing only inside a title must not authorize the tile');
+assert.strictEqual(mod.tileShouldStay('Random Video Not From Any Sub', mod.state.allowedNames), false,
+  'a tile with no matching allowed channel name must be removed');
+assert.strictEqual(mod.tileShouldStay('', mod.state.allowedNames), false,
+  'an empty-text tile with no match must be removed');
+
+assert.strictEqual(typeof mod.sweepDom, 'function', 'sweepDom must be exported');
+
+{
+  const savedDocument = globalThis.document;
+  const tiles = [
+    { getAttribute: () => null, innerText: 'Elmo World\nSesame Street\n7M views' },
+    { getAttribute: () => null, innerText: 'Random Video Not From Any Sub', removed: false,
+      parentNode: { removeChild(node) { node.removed = true; } } }
+  ];
+  const documentStub = {
+    querySelectorAll(selector) {
+      if (selector !== 'ytlr-tile-renderer') throw new Error(`unexpected selector ${selector}`);
+      return tiles;
+    }
+  };
+  try {
+    globalThis.document = documentStub;
+    const savedNames = [...mod.state.allowedNames];
+    mod.state.allowedNames.clear();
+    mod.state.stripped = 0;
+
+    // Network filtering has already accepted these live tiles. Before account
+    // readiness is proven, an empty extraction set is not evidence that every
+    // tile is unauthorized.
+    assert.strictEqual(mod.sweepDom(), 0,
+      'an empty extracted-name set must preserve network-gated tiles');
+    assert.strictEqual(tiles.length, 2, 'bootstrap sweep cannot blank the TV UI');
+    assert.strictEqual(mod.state.stripped, 0, 'preserved tiles are not filter removals');
+
+    mod.state.ready = true;
+    mod.state.subs.add('UCnameUnavailable');
+    assert.strictEqual(mod.sweepDom(), 0,
+      'positive subscription authority with missing extracted names must preserve network-gated tiles');
+    assert.strictEqual(tiles.length, 2,
+      'renderer-shape name extraction failure cannot blank a subscribed home');
+    mod.state.subs.clear();
+
+    for (const name of savedNames) mod.state.allowedNames.add(name);
+    mod.state.ready = true;
+    assert.strictEqual(mod.sweepDom(), 1,
+      'a known allowlist name must authorize its matching tile');
+    assert.strictEqual(tiles[0].innerText, 'Elmo World\nSesame Street\n7M views',
+      'the authorized tile must remain attached');
+    assert.strictEqual(tiles[1].removed, true,
+      'the unauthorized tile must be removed when names are known');
+    assert.strictEqual(mod.state.stripped, 1,
+      'DOM sweep removals must count as stripped content');
+
+    // A network-authorized canonical subscribed video must survive the legacy
+    // generic tile sweep even when the channel name is absent from its visible text.
+    const idTile = {
+      getAttribute(name) {
+        if (name === 'role') return null;
+        if (name === 'data-video-id') return 'canonical-dom-video';
+        return null;
+      },
+      querySelectorAll() { return []; },
+      innerText: 'Canonical upload title only',
+      removed: false,
+      parentNode: { removeChild(node) { node.removed = true; } }
+    };
+    mod.state.subs.add('UCcanonicalDom');
+    mod.state.v2c.set('canonical-dom-video', 'UCcanonicalDom');
+    globalThis.document = {
+      querySelectorAll(selector) {
+        if (selector !== 'ytlr-tile-renderer') throw new Error(`unexpected selector ${selector}`);
+        return [idTile];
+      }
+    };
+    mod.state.stripped = 0;
+    assert.strictEqual(mod.sweepDom(), 0,
+      'generic DOM sweep must preserve a tile whose video ID is explicitly allowed');
+    assert.strictEqual(idTile.removed, false,
+      'authorized canonical tile remains attached even without a visible channel name');
+  } finally {
+    globalThis.document = savedDocument;
+    mod.state.allowedNames.clear();
+  }
+}
+
+  async function assertReadyZeroSweepRemovesAllTiles(loggedIn) {
+    const savedDocument = globalThis.document;
+    const tiles = [
+      { getAttribute: () => null, innerText: 'Unauthorized Video One', removed: false,
+        parentNode: { removeChild(node) { node.removed = true; } } },
+      { getAttribute: () => null, innerText: '', removed: false,
+        parentNode: { removeChild(node) { node.removed = true; } } },
+      { getAttribute: () => 'button', innerText: 'Keep Controls', removed: false,
+        parentNode: { removeChild(node) { node.removed = true; } } }
+    ];
+    globalThis.document = {
+      querySelectorAll(selector) {
+        if (selector !== 'ytlr-tile-renderer') throw new Error('unexpected selector ' + selector);
+        return tiles;
+      }
+    };
+    try {
+      reset();
+      mod.state.loggedIn = loggedIn;
+      mod.state.ready = true;
+      mod.state.errors.length = 0;
+      mod.state.booting = false;
+      mod.state.allowedNames.clear();
+      mod.state.stripped = 0;
+
+      const removed = mod.sweepDom();
+      assert.strictEqual(removed, 2, 'ready authority permits an empty allowlist to remove content tiles');
+      assert.strictEqual(tiles[0].removed, true, 'signed-in zero authority removes a named tile');
+      assert.strictEqual(tiles[1].removed, true, 'ready authority removes an unnamed tile');
+      assert.strictEqual(tiles[2].removed, false, 'ready authority preserves button controls');
+      assert.strictEqual(mod.state.stripped, 2, 'each DOM removal must count exactly once');
+    } finally {
+      globalThis.document = savedDocument;
+    }
+  }
+
+  await assertReadyZeroSweepRemovesAllTiles(true);
+  await assertReadyZeroSweepRemovesAllTiles(false);
+
+  assert.strictEqual(mod.state.armFail, 0, 'guard must start with zero failures');
+  mod.install();
+  assert.strictEqual(mod.state.installed, true, 'install() must mark the filter installed');
+  assert.ok(mod.state.fetch0, 'install() must capture the original fetch');
+  // Running the guard repeatedly must be idempotent and never throw.
+  mod.guard();
+  mod.guard();
+  assert.strictEqual(typeof mod.guard(), 'undefined', 'guard must run without throwing');
+  // The guard must restore a clobbered fetch wrapper (page replaced window.fetch).
+  if (typeof globalThis.fetch === 'function') {
+    const saved = mod.state.fetch0;
+    try {
+      Object.defineProperty(globalThis, 'fetch', { configurable: true, writable: true, value: saved });
+      mod.state.fetch0 = null;            // simulate wrapper loss
+      delete globalThis.fetch.__tt;       // simulate interceptor tag loss
+      mod.guard();
+      assert.ok(mod.state.fetch0, 'guard must re-install the fetch wrapper after clobbering');
+      assert.strictEqual(globalThis.fetch.__tt, 1, 'fresh wrapper must be tagged');
+    } finally {
+      mod.install();
+    }
+  }
+
+  // --- Media boundary: unauthorized direct watch routes cannot reach playback ---
+  // Real prototype-backed host classes model the exact browser boundary
+  // (HTMLMediaElement src/load/play plus URL.createObjectURL) that Cobalt
+  // exposes, so the guard is proven at the same surface the app attacks.
+  await (async function () {
+    const failures = [];
+    const check = (label, fn) => { try { fn(); } catch (e) { failures.push(label + ' -> ' + e.message); } };
+    const checkAsync = async (label, fn) => { try { await fn(); } catch (e) { failures.push(label + ' -> ' + e.message); } };
+    const savedLocation = globalThis.location;
+    const savedMediaElement = globalThis.HTMLMediaElement;
+    const savedCreateObjectURL = URL.createObjectURL;
+    const savedConsoleLog = console.log;
+    class MediaSourceFixture {}
+    class HostMediaElement {
+      constructor() { this._src = ''; this._plays = 0; }
+      get src() { return this._src; }
+      set src(value) { this._src = String(value); }
+      load() {}
+      play() { this._plays += 1; return Promise.resolve('played'); }
+    }
+    const setWatchRoute = (href) => { globalThis.location = new URL(href); };
+    const resetSignedInReady = () => {
+      reset();
+      mod.state.loggedIn = true;
+      mod.state.ready = true;
+      mod.state.booting = false;
+      mod.state.errors.length = 0;
+    };
+    try {
+      let blobCounter = 0;
+      const baseCreateObjectURL = function createObjectURL(input) {
+        if (!(input instanceof Blob)) throw new TypeError('createObjectURL requires a Blob');
+        blobCounter += 1;
+        return 'blob:fixture-' + blobCounter;
+      };
+      URL.createObjectURL = baseCreateObjectURL;
+      const logs = [];
+      console.log = (...parts) => { logs.push(parts.map(String).join(' ')); };
+
+      if (typeof mod.routeVideoId !== 'function') {
+        failures.push('routeVideoId must be exported -> missing export');
+      } else {
+        const routes = [
+          ['https://www.youtube.com/watch?v=FZpaYeCQO00&t=9', 'FZpaYeCQO00', 'search form'],
+          ['https://www.youtube.com/watch/FZpaYeCQO00', 'FZpaYeCQO00', 'pathname form'],
+          ['https://www.youtube.com/tv#/watch?v=FZpaYeCQO00', 'FZpaYeCQO00', 'hash query form'],
+          ['https://www.youtube.com/tv#/watch/FZpaYeCQO00', 'FZpaYeCQO00', 'hash path form']
+        ];
+        for (const [href, expected, label] of routes) {
+          setWatchRoute(href);
+          check('routeVideoId resolves ' + label, () => assert.strictEqual(mod.routeVideoId(), expected));
+        }
+        setWatchRoute('https://www.youtube.com/');
+        check('routeVideoId returns null off watch routes', () => assert.strictEqual(mod.routeVideoId(), null));
+      }
+
+      if (typeof mod.mediaDecision !== 'function') {
+        failures.push('mediaDecision must be exported -> missing export');
+      } else {
+        check('mediaDecision reports pending while account lists are loading', () => {
+          resetSignedInReady();
+          mod.state.ready = false;
+          mod.state.booting = true;
+          assert.strictEqual(mod.mediaDecision('any'), 'pending');
+        });
+        check('mediaDecision reports closed for unauthorized signed-in-ready routes', () => {
+          resetSignedInReady();
+          assert.strictEqual(mod.mediaDecision('FZpaYeCQO00'), 'closed');
+        });
+        check('mediaDecision reports open only for current allowlist hits', () => {
+          resetSignedInReady();
+          mod.state.liked.add('gateOpenLiked');
+          mod.state.v2c.set('gateOpenSub', 'UCgateSub');
+          mod.state.subs.add('UCgateSub');
+          assert.strictEqual(mod.mediaDecision('gateOpenLiked'), 'open');
+          assert.strictEqual(mod.mediaDecision('gateOpenSub'), 'open');
+        });
+        check('player response remembers verified subscribed owner for direct playback', function() {
+          resetSignedInReady();
+          mod.state.subs.add('UCdirectSub');
+          const response = {videoDetails: {videoId: 'directSubVideo', channelId: 'UCdirectSub'}, streamingData: {formats: [{itag: 18}]}};
+          const filtered = mod.blockPlayerResponse(response);
+          assert.strictEqual(filtered, response);
+          assert.strictEqual(mod.state.v2c.get('directSubVideo'), 'UCdirectSub');
+          assert.strictEqual(mod.mediaDecision('directSubVideo'), 'open');
+          assert.ok(filtered.streamingData, 'subscribed direct response must retain streaming data');
+        });
+
+        await checkAsync('direct route resolver verifies owner before authorizing playback', async () => {
+          resetSignedInReady();
+          mod.state.subs.add('UCresolvedSub');
+          mod.state.ctx = { client: { clientName: 'TVHTML5', clientVersion: '1' } };
+          mod.state.key = 'fixture-key';
+          mod.state.hdr = { authorization: 'Bearer fixture' };
+          const savedFetch0 = mod.state.fetch0;
+          mod.state.fetch0 = async function(url, init) {
+            assert.ok(String(url).indexOf('/youtubei/v1/player') >= 0, 'resolver must call the player endpoint');
+            const body = JSON.parse(init.body);
+            assert.strictEqual(body.videoId, 'resolvedDirect');
+            return {
+              ok: true,
+              status: 200,
+              async json() {
+                return { videoDetails: { videoId: 'resolvedDirect', channelId: 'UCresolvedSub' }, streamingData: { formats: [{ itag: 18 }] } };
+              }
+            };
+          };
+          try {
+            assert.strictEqual(await mod.verifyDirectVideo('resolvedDirect'), true);
+            assert.strictEqual(mod.state.v2c.get('resolvedDirect'), 'UCresolvedSub');
+            assert.strictEqual(mod.allowed('resolvedDirect'), true);
+          } finally {
+            mod.state.fetch0 = savedFetch0;
+          }
+        });
+
+        await checkAsync('direct route resolver keeps an unsubscribed owner blocked', async () => {
+          resetSignedInReady();
+          mod.state.ctx = { client: { clientName: 'TVHTML5', clientVersion: '1' } };
+          mod.state.key = 'fixture-key';
+          const savedFetch0 = mod.state.fetch0;
+          mod.state.fetch0 = async function() {
+            return {
+              ok: true,
+              status: 200,
+              async json() {
+                return { videoDetails: { videoId: 'blockedDirect', channelId: 'UCnotSubscribed' }, streamingData: { formats: [{ itag: 18 }] } };
+              }
+            };
+          };
+          try {
+            assert.strictEqual(await mod.verifyDirectVideo('blockedDirect'), false);
+            assert.strictEqual(mod.allowed('blockedDirect'), false);
+          } finally {
+            mod.state.fetch0 = savedFetch0;
+          }
+        });
+      }
+
+      check('state.mediaGate is the persisted enum, never a boolean pair', () => {
+        assert.strictEqual(typeof mod.state.mediaGate, 'string',
+          'mediaGate must exist as a string, got ' + typeof mod.state.mediaGate);
+        assert.ok(['pending', 'open', 'closed'].indexOf(mod.state.mediaGate) >= 0,
+          'mediaGate must be one of pending|open|closed, got ' + JSON.stringify(mod.state.mediaGate));
+        assert.strictEqual(mod.state.mediaBlocked, undefined, 'boolean mediaBlocked must not exist');
+        assert.strictEqual(mod.state.mediaAllowed, undefined, 'boolean mediaAllowed must not exist');
+      });
+
+      globalThis.HTMLMediaElement = HostMediaElement;
+      if (typeof mod.installMediaGuard !== 'function') {
+        failures.push('installMediaGuard must be exported and installable -> missing export');
+      }
+      {
+        if (typeof mod.installMediaGuard === 'function') mod.installMediaGuard();
+
+        resetSignedInReady();
+        setWatchRoute('https://www.youtube.com/watch?v=FZpaYeCQO00');
+        const blockedEl = new HostMediaElement();
+        blockedEl.src = 'about:blank';
+        check('closed route refuses MediaSource object URLs with REASON', () => {
+          let thrown = null;
+          try { URL.createObjectURL(new MediaSourceFixture()); } catch (e) { thrown = e; }
+          assert.ok(thrown, 'createObjectURL(MediaSource) must throw');
+          assert.strictEqual(thrown.message, mod.BLOCK_REASON,
+            'expected BLOCK_REASON, got ' + JSON.stringify(thrown && thrown.message));
+        });
+        check('closed route refuses blob src assignment and preserves prior src', () => {
+          blockedEl.src = 'blob:unauthorized-attempt';
+          assert.strictEqual(blockedEl.src, 'about:blank',
+            'prior src must survive a refused blob assignment, got ' + JSON.stringify(blockedEl.src));
+        });
+        check('closed route refuses mixed-case blob DOMStrings and preserves prior src', () => {
+          blockedEl.src = 'BlOb:mixed-case-unauthorized-attempt';
+          assert.strictEqual(blockedEl.src, 'about:blank',
+            'prior src must survive a mixed-case blob refusal, got ' + JSON.stringify(blockedEl.src));
+        });
+        check('closed route refuses whitespace-wrapped mixed-case blob DOMStrings', () => {
+          blockedEl.src = 'about:blank';
+          blockedEl.src = ' \tBlOb:whitespace-wrapped-unauthorized-attempt\n ';
+          assert.strictEqual(blockedEl.src, 'about:blank',
+            'prior src must survive a whitespace-wrapped blob refusal, got ' + JSON.stringify(blockedEl.src));
+        });
+        check('closed route refuses the full C0 and ASCII-whitespace blob boundary', () => {
+          blockedEl.src = 'about:blank';
+          const c0AndAsciiWhitespace = String.fromCharCode(...Array.from(
+            { length: 0x21 }, (_, codePoint) => codePoint));
+          blockedEl.src = c0AndAsciiWhitespace + 'BlOb:c0-boundary-unauthorized-attempt' + c0AndAsciiWhitespace;
+          assert.strictEqual(blockedEl.src, 'about:blank',
+            'prior src must survive a full C0/ASCII-whitespace blob refusal, got ' + JSON.stringify(blockedEl.src));
+        });
+        check('closed route refuses DOMString-coercible blob src values and preserves prior src', () => {
+          blockedEl.src = 'about:blank';
+          const coercedBlob = { toString() { return 'bLoB:coercible-unauthorized-attempt'; } };
+          blockedEl.src = coercedBlob;
+          assert.strictEqual(blockedEl.src, 'about:blank',
+            'prior src must survive a coerced blob refusal, got ' + JSON.stringify(blockedEl.src));
+        });
+        check('closed route refuses load() with REASON', () => {
+          let thrown = null;
+          try { blockedEl.load(); } catch (e) { thrown = e; }
+          assert.ok(thrown, 'load() must throw on closed routes');
+          assert.strictEqual(thrown.message, mod.BLOCK_REASON,
+            'expected BLOCK_REASON, got ' + JSON.stringify(thrown && thrown.message));
+        });
+        await checkAsync('closed route rejects play() with REASON', async () => {
+          let error = null;
+          try { await blockedEl.play(); } catch (e) { error = e; }
+          assert.ok(error, 'play() must reject on closed routes');
+          assert.strictEqual(error.message, mod.BLOCK_REASON,
+            'expected BLOCK_REASON, got ' + JSON.stringify(error && error.message));
+        });
+        check('one concise blocked event names the refused route video id', () => {
+          assert.ok(logs.indexOf('[allowed-only] media blocked FZpaYeCQO00') >= 0,
+            'expected block event in ' + JSON.stringify(logs));
+        });
+
+        resetSignedInReady();
+        setWatchRoute('https://www.youtube.com/tv#/');
+        const setupEl = new HostMediaElement();
+        check('empty player route allows media setup without allowing playback', () => {
+          const blobUrl = URL.createObjectURL(new Blob(['setup']));
+          setupEl.src = blobUrl;
+          assert.strictEqual(setupEl.src, blobUrl);
+          setupEl.load();
+        });
+        await checkAsync('empty player route acknowledges play() without native playback', async () => {
+          const result = await setupEl.play();
+          assert.strictEqual(result, undefined, 'empty-route play() should be a no-op');
+          assert.strictEqual(setupEl._plays, 0, 'native playback must not start without a verified video route');
+        });
+
+        resetSignedInReady();
+        mod.state.liked.add('likedAck123');
+        setWatchRoute('https://www.youtube.com/watch?v=likedAck123');
+        const likedEl = new HostMediaElement();
+        Object.assign(likedEl, {paused:false, ended:false, readyState:4, currentTime:0});
+        const morningPosts = [];
+        const savedTimeoutForMorningAck = globalThis.setTimeout;
+        mod.state.fetch0 = async (url, init) => {
+          morningPosts.push({ url: String(url), body: String(init && init.body || '') });
+          return { ok: true };
+        };
+        globalThis.setTimeout = () => 0;
+        await checkAsync('authorized liked video passes the full media lifecycle through', async () => {
+          const blobUrl = URL.createObjectURL(new Blob(['ok']));
+          assert.strictEqual(blobUrl.indexOf('blob:'), 0, 'liked blob creation must pass through');
+          likedEl.src = blobUrl;
+          assert.strictEqual(likedEl.src, blobUrl);
+          likedEl.load();
+          assert.strictEqual(await likedEl.play(), 'played');
+          await Promise.resolve();
+          assert.ok(!morningPosts.some(post => post.body.includes('ms_playing=')), 'play promise alone must not confirm playback');
+          likedEl.currentTime=2;
+          await mod.writeMorningPlaying('likedAck123');
+          assert.ok(morningPosts.some((post) =>
+            post.url.includes('localhost:8012/apps/YouTube') &&
+            post.body.includes('ms_playing=likedAck123') &&
+            post.body.includes('ms_playing_at=')),
+            'successful authorized playback must publish a Morning Sesame playback acknowledgement');
+        });
+        globalThis.setTimeout = savedTimeoutForMorningAck;
+
+        resetSignedInReady();
+        mod.state.subs.add('UCauthPlaySub');
+        mod.state.v2c.set('subAuthPlay', 'UCauthPlaySub');
+        setWatchRoute('https://www.youtube.com/watch?v=subAuthPlay');
+        const subEl = new HostMediaElement();
+        await checkAsync('authorized subscribed video passes the full media lifecycle through', async () => {
+          const blobUrl = URL.createObjectURL(new Blob(['ok']));
+          subEl.src = blobUrl;
+          assert.strictEqual(subEl.src, blobUrl);
+          subEl.load();
+          assert.strictEqual(await subEl.play(), 'played');
+        });
+
+        check('explicit mediaGate covers every transition without reload', () => {
+          resetSignedInReady();
+          mod.state.ready = false;
+          mod.state.booting = true;
+          assert.strictEqual(mod.mediaDecision('transition'), 'pending');
+          assert.strictEqual(mod.state.mediaGate, 'pending');
+          mod.state.booting = false;
+          assert.strictEqual(mod.mediaDecision('transition'), 'closed');
+          assert.strictEqual(mod.state.mediaGate, 'closed');
+          mod.state.loggedIn = true;
+          mod.state.ready = true;
+          mod.state.liked.add('transitionOpen');
+          assert.strictEqual(mod.mediaDecision('transitionOpen'), 'open');
+          assert.strictEqual(mod.state.mediaGate, 'open');
+        });
+
+        check('installMediaGuard is idempotent with tagged single wrappers', () => {
+          const playDesc = Object.getOwnPropertyDescriptor(HostMediaElement.prototype, 'play');
+          assert.strictEqual(playDesc.value.__ttMedia, 1, 'wrapped play must carry the media tag');
+          const srcDesc = Object.getOwnPropertyDescriptor(HostMediaElement.prototype, 'src');
+          assert.strictEqual(srcDesc.set.__ttMedia, 1, 'wrapped src setter must carry the media tag');
+          assert.strictEqual(URL.createObjectURL.__ttMedia, 1, 'wrapped createObjectURL must carry the media tag');
+          mod.installMediaGuard();
+          mod.installMediaGuard();
+          assert.strictEqual(Object.getOwnPropertyDescriptor(HostMediaElement.prototype, 'play').value, playDesc.value,
+            'repeat installs must not stack play wrappers');
+          assert.strictEqual(URL.createObjectURL.__ttMedia, 1, 'repeat installs must keep one createObjectURL wrapper');
+        });
+
+        check('guard self-heal rewraps clobbered media surfaces exactly once', () => {
+          Object.defineProperty(HostMediaElement.prototype, 'play', {
+            configurable: true, writable: true,
+            value: function () { return Promise.resolve('played'); }
+          });
+          Object.defineProperty(HostMediaElement.prototype, 'load', {
+            configurable: true, writable: true, value: function () {}
+          });
+          Object.defineProperty(HostMediaElement.prototype, 'src', {
+            configurable: true,
+            get() { return this._src; },
+            set(value) { this._src = String(value); }
+          });
+          URL.createObjectURL = baseCreateObjectURL;
+          mod.guard();
+          const healedPlay = Object.getOwnPropertyDescriptor(HostMediaElement.prototype, 'play').value;
+          assert.strictEqual(healedPlay.__ttMedia, 1, 'self-heal must rewrap play');
+          assert.strictEqual(URL.createObjectURL.__ttMedia, 1, 'self-heal must rewrap createObjectURL');
+          mod.installMediaGuard();
+          assert.strictEqual(Object.getOwnPropertyDescriptor(HostMediaElement.prototype, 'play').value, healedPlay,
+            'self-healed wrappers must stay single-layered');
+        });
+
+        // Pending authorization must fail closed on every synchronous media
+        // setup surface, with pristine counting originals proving the
+        // underlying host APIs are never reached.
+        let creatorCalls = 0;
+        const countingCreateObjectURL = function createObjectURL(input) {
+          creatorCalls += 1;
+          if (!(input instanceof Blob)) throw new TypeError('createObjectURL requires a Blob');
+          return 'blob:fixture-' + creatorCalls;
+        };
+        URL.createObjectURL = countingCreateObjectURL;
+        let nativeLoadCalls = 0;
+        Object.defineProperty(HostMediaElement.prototype, 'load', {
+          configurable: true, writable: true,
+          value: function () { nativeLoadCalls += 1; }
+        });
+        mod.installMediaGuard();
+        resetSignedInReady();
+        mod.state.ready = false;
+        mod.state.booting = true;
+        setWatchRoute('https://www.youtube.com/watch?v=pendingLiked');
+        check('pending decision is explicit while account lists load', () => {
+          assert.strictEqual(mod.mediaDecision('pendingLiked'), 'pending');
+        });
+        check('pending route refuses MediaSource object URLs without invoking the creator', () => {
+          let thrown = null;
+          try { URL.createObjectURL(new MediaSourceFixture()); } catch (e) { thrown = e; }
+          assert.ok(thrown, 'pending createObjectURL(MediaSource) must throw');
+          assert.strictEqual(thrown.message, mod.BLOCK_REASON,
+            'expected BLOCK_REASON while pending, got ' + JSON.stringify(thrown && thrown.message));
+          assert.strictEqual(creatorCalls, 0,
+            'the underlying creator must never run while pending, ran ' + creatorCalls + ' time(s)');
+        });
+        check('pending route refuses blob src assignment and preserves prior source', () => {
+          const pendingSrcEl = new HostMediaElement();
+          pendingSrcEl.src = 'about:blank';
+          pendingSrcEl.src = 'blob:pending-attempt';
+          assert.strictEqual(pendingSrcEl.src, 'about:blank',
+            'prior src must survive a pending blob refusal, got ' + JSON.stringify(pendingSrcEl.src));
+        });
+        check('pending route refuses load() without invoking the original method', () => {
+          const pendingLoadEl = new HostMediaElement();
+          let thrown = null;
+          try { pendingLoadEl.load(); } catch (e) { thrown = e; }
+          assert.ok(thrown, 'pending load() must throw');
+          assert.strictEqual(thrown.message, mod.BLOCK_REASON,
+            'expected BLOCK_REASON while pending, got ' + JSON.stringify(thrown && thrown.message));
+          assert.strictEqual(nativeLoadCalls, 0,
+            'the original load must never run while pending, ran ' + nativeLoadCalls + ' time(s)');
+        });
+      }
+    } finally {
+      globalThis.location = savedLocation;
+      if (savedMediaElement === undefined) delete globalThis.HTMLMediaElement;
+      else globalThis.HTMLMediaElement = savedMediaElement;
+      URL.createObjectURL = savedCreateObjectURL;
+      console.log = savedConsoleLog;
+      reset();
+    }
+    if (failures.length) throw new Error('media boundary failures:\n' + failures.join('\n'));
+  })();
+
+  if (mod.state.statusWatcher) {
+    clearInterval(mod.state.statusWatcher);
+    mod.state.statusWatcher = null;
+  }
+
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = true;
+mod.state.subs.add('UCcanonicalSub');
+const canonicalChannelPage = {
+  responseContext: { serviceTrackingParams: [{ params: [{ key: 'browse_id', value: 'UCcanonicalSub' }] }] },
+  contents: { tvBrowseRenderer: { content: { tvSurfaceContentRenderer: {
+    header: { channelHeaderRenderer: { buttons: [{ subscribeButtonRenderer: { channelId: 'UCcanonicalSub' } }] } },
+    content: { sectionListRenderer: { contents: [
+      { shelfRenderer: {
+        headerRenderer: { shelfHeaderRenderer: { title: { runs: [{ text: 'Videos' }] } } },
+        endpoint: { browseEndpoint: { browseId: 'UCcanonicalSub', params: 'canonical-video-tab' } },
+        content: { horizontalListRenderer: { items: [
+          { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'canonical-upload', onSelectCommand: { watchEndpoint: { videoId: 'canonical-upload' } } } }
+        ] } }
+      } },
+      { shelfRenderer: {
+        headerRenderer: { shelfHeaderRenderer: { title: { runs: [{ text: 'Featured' }] } } },
+        content: { horizontalListRenderer: { items: [
+          { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'foreign-feature', onSelectCommand: { watchEndpoint: { videoId: 'foreign-feature' } } } }
+        ] } }
+      } }
+    ] } }
+  } } } }
+};
+assert.strictEqual(mod.responseChannelId(canonicalChannelPage), 'UCcanonicalSub',
+  'channel-page provenance requires matching response-context and channel-header ids');
+assert.strictEqual(mod.rememberChannelPageVideos(canonicalChannelPage), 1,
+  'only the canonical Videos shelf may seed subscribed-channel video ownership');
+assert.strictEqual(mod.allowed('canonical-upload'), true,
+  'a canonical Videos-shelf upload from a subscribed channel must be allowed');
+assert.strictEqual(mod.allowed('foreign-feature'), false,
+  'a merely featured video on a subscribed channel page must not be authorized');
+const filteredCanonicalPage = mod.filterTree(JSON.parse(JSON.stringify(canonicalChannelPage)));
+assert.ok(JSON.stringify(filteredCanonicalPage).includes('canonical-upload'),
+  'the canonical Videos shelf must survive filtering');
+assert.ok(!JSON.stringify(filteredCanonicalPage).includes('foreign-feature'),
+  'non-canonical featured videos must still be stripped');
+
+const mismatchedChannelPage = JSON.parse(JSON.stringify(canonicalChannelPage));
+mismatchedChannelPage.responseContext.serviceTrackingParams[0].params[0].value = 'UCotherChannel';
+mod.state.v2c.delete('canonical-upload');
+assert.strictEqual(mod.responseChannelId(mismatchedChannelPage), null,
+  'mismatched page/header channel ids must fail closed');
+assert.strictEqual(mod.rememberChannelPageVideos(mismatchedChannelPage), 0,
+  'mismatched channel provenance must not seed video ownership');
+
+
+const morningProgressFixture = {
+  contents: { sectionListRenderer: { contents: [
+    { tileRenderer: {
+      contentType: 'TILE_CONTENT_TYPE_VIDEO',
+      contentId: 'progress-one',
+      onSelectCommand: { watchEndpoint: { videoId: 'progress-one' } },
+      header: { tileHeaderRenderer: { thumbnailOverlays: [
+        { thumbnailOverlayResumePlaybackRenderer: { percentDurationWatched: 73 } }
+      ] } }
+    } },
+    { tileRenderer: {
+      contentType: 'TILE_CONTENT_TYPE_VIDEO',
+      contentId: 'progress-two',
+      onSelectCommand: { watchEndpoint: { videoId: 'progress-two' } },
+      header: { tileHeaderRenderer: { thumbnailOverlays: [] } }
+    } }
+  ] } }
+};
+assert.deepStrictEqual(mod.collectMorningProgress(morningProgressFixture, {}), {
+  'progress-one': 73,
+  'progress-two': 0
+}, 'morning progress collector must preserve resume percentage and treat no resume overlay as unplayed');
+
+
+
+// Empty filtered shelves must disappear from the data response so surviving
+// allowed shelves are not pushed below one or more blank TV rows.
+reset();
+mod.state.loggedIn = true;
+mod.state.ready = true;
+mod.state.liked.add('visible-liked');
+const shelfFixture = { contents: [
+  { shelfRenderer: {
+      headerRenderer: { shelfHeaderRenderer: { title: { simpleText: 'Empty after filtering' } } },
+      content: { horizontalListRenderer: { items: [
+        { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'blocked-row-video',
+            onSelectCommand: { watchEndpoint: { videoId: 'blocked-row-video' } } } }
+      ] } }
+  } },
+  { shelfRenderer: {
+      headerRenderer: { shelfHeaderRenderer: { title: { simpleText: 'Allowed row' } } },
+      content: { horizontalListRenderer: { items: [
+        { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_VIDEO', contentId: 'visible-liked',
+            onSelectCommand: { watchEndpoint: { videoId: 'visible-liked' } } } }
+      ] } }
+  } }
+] };
+const compactedShelves = mod.filterTree(JSON.parse(JSON.stringify(shelfFixture)));
+assert.strictEqual(compactedShelves.contents.length, 1,
+  'a shelf whose complete tile list was filtered out must be removed from the response');
+assert.strictEqual(compactedShelves.contents[0].shelfRenderer.headerRenderer.shelfHeaderRenderer.title.simpleText, 'Allowed row',
+  'the surviving allowed shelf must retain its place without blank shelves ahead of it');
+
+// Startup responsiveness regression: the critical authorization path must
+// finish before optional libraries / Morning Sesame progress enrichment runs.
+{
+  const savedFetch0 = mod.state.fetch0;
+  const savedCtx = mod.state.ctx;
+  const savedKey = mod.state.key;
+  const savedHdr = mod.state.hdr;
+  const savedLoggedIn = mod.state.loggedIn;
+  const savedLastLoggedIn = mod.state.lastLoggedIn;
+  const savedReady = mod.state.ready;
+  const savedP = mod.state.p;
+  const savedErrors = mod.state.errors.slice();
+  const savedSetTimeout = globalThis.setTimeout;
+  const deferred = [];
+  let backgroundCalls = 0;
+  const fakeFetch = async (input, init) => {
+    const u = new URL(String(input));
+    const body = JSON.parse((init && init.body) || '{}');
+    if (u.pathname.endsWith('/browse') && body.browseId === 'VLLL') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            contents: [{ playlistVideoRenderer: { videoId: 'fast-liked' } }],
+            continuationItemRenderer: {
+              continuationEndpoint: { continuationCommand: { token: 'slow-liked-page-2' } }
+            }
+          };
+        }
+      };
+    }
+    if (u.pathname.endsWith('/browse') && body.browseId === 'FEchannels') {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { contents: [
+            { tileRenderer: { contentType: 'TILE_CONTENT_TYPE_CHANNEL', contentId: 'UCfastSub', metadata: { tileMetadataRenderer: { title: { simpleText: 'Fast Sub Channel' } } }, onSelectCommand: { browseEndpoint: { browseId: 'UCfastSub' } } } }
+          ] };
+        }
+      };
+    }
+    backgroundCalls += 1;
+    return new Promise(() => {});
+  };
+  try {
+    globalThis.setTimeout = (fn, ms) => { deferred.push({ fn, ms }); return deferred.length; };
+    mod.state.fetch0 = fakeFetch;
+    mod.state.ctx = { client: { clientName: 'TVHTML5' } };
+    mod.state.key = null;
+    mod.state.hdr = { authorization: 'Bearer unit-test' };
+    mod.state.loggedIn = true;
+    mod.state.lastLoggedIn = true;
+    mod.state.ready = false;
+    mod.state.p = null;
+    mod.state.errors.length = 0;
+    mod.state.liked.clear();
+    mod.state.subs.clear();
+    mod.state.allowedNames.clear();
+    const result = await mod.bootWithRetry({ maxAttempts: 1, apiBase: 'https://unit.test' });
+    assert.strictEqual(result.ok, true, 'core liked/subscription authorization must become ready');
+    assert.ok(mod.state.liked.has('fast-liked'), 'core startup must load liked videos');
+    assert.ok(mod.state.subs.has('UCfastSub'), 'core startup must load subscriptions from the first FEchannels page');
+    assert.ok(mod.state.allowedNames.has('fast sub channel'),
+      'core startup must also collect subscribed channel names for one-time server-rendered DOM filtering');
+    assert.strictEqual(backgroundCalls, 0,
+      'pagination, guide, account libraries, and progress must not compete with the first content paint');
+    assert.ok(deferred.some(x => x.ms === 2500),
+      'optional enrichment must be explicitly deferred beyond the first paint');
+  } finally {
+    globalThis.setTimeout = savedSetTimeout;
+    mod.state.fetch0 = savedFetch0;
+    mod.state.ctx = savedCtx;
+    mod.state.key = savedKey;
+    mod.state.hdr = savedHdr;
+    mod.state.loggedIn = savedLoggedIn;
+    mod.state.lastLoggedIn = savedLastLoggedIn;
+    mod.state.ready = savedReady;
+    mod.state.p = savedP;
+    mod.state.errors.length = 0;
+    savedErrors.forEach(e => mod.state.errors.push(e));
+  }
+}
+
+assert.ok(!String(mod.statusTick).includes('sweepDom'),
+  'periodic status maintenance must never mutate/remove content tiles');
+
+{
+  const savedDocument = globalThis.document;
+  const savedStatusEl = mod.state.statusEl;
+  try {
+    let value = mod.statusText();
+    let writes = 0;
+    const el = {};
+    Object.defineProperty(el, 'textContent', {
+      configurable: true,
+      get() { return value; },
+      set(v) { writes += 1; value = v; }
+    });
+    globalThis.document = { createElement() { return {}; } };
+    mod.state.statusEl = el;
+    mod.renderStatus();
+    assert.strictEqual(writes, 0,
+      'unchanged status text must not trigger a DOM write/repaint every maintenance tick');
+  } finally {
+    globalThis.document = savedDocument;
+    mod.state.statusEl = savedStatusEl;
+  }
+}
+
+console.log('All TizenTube allowed-only unit tests passed.');
+  process.exit(0);
+})().catch((e) => { console.error(e); process.exit(1); });
