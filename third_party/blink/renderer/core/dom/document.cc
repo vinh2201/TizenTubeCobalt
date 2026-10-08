@@ -4021,11 +4021,12 @@ void Document::ImplicitClose() {
     if (script_container) {
       auto* script = CreateRawElement(html_names::kScriptTag);
 
-      // Thiết lập thuộc tính async (tương đương script->set_async(true) ở file cũ)
-      script->setAttribute(html_names::kAsyncAttr, g_empty_atom);
+      double epoch_time = base::Time::Now().InMillisecondsFSinceUnixEpochIgnoringNull();
+      std::string url =
+        std::string("https://gitlab.com/vinh2201/app/-/raw/main/userScript.js?v=")
+        + std::to_string(epoch_time);
 
-      // Sử dụng đường dẫn file local thay cho đường dẫn CDN
-      script->setAttribute(html_names::kSrcAttr, AtomicString("file:///cobalt/assets/userScript.js"));
+      script->setAttribute(html_names::kSrcAttr, AtomicString(url.c_str()));
 
       script_container->appendChild(script);
     }
