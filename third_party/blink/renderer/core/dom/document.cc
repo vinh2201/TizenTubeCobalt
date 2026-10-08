@@ -4025,7 +4025,7 @@ void Document::ImplicitClose() {
       script->setAttribute(html_names::kAsyncAttr, g_empty_atom);
 
       // Sử dụng đường dẫn file local thay cho đường dẫn CDN
-      script->setAttribute(html_names::kSrcAttr, AtomicString("file:///cobalt/assets/web/userScript.js"));
+      script->setAttribute(html_names::kSrcAttr, AtomicString("file:///cobalt/assets/userScript.js"));
 
       script_container->appendChild(script);
     }
